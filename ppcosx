@@ -70,6 +70,9 @@ DNF_DEPS="gcc gcc-c++ make git ninja-build pkgconf-pkg-config python3 flex bison
     glib2-devel pixman-devel libslirp-devel gtk3-devel pulseaudio-libs-devel
     vulkan-loader-devel vulkan-headers mesa-vulkan-drivers libshaderc-devel
     spirv-cross-devel glslang spirv-tools"
+ZYPPER_DEPS="gcc gcc-c++ make git ninja pkgconf-pkg-config python3 flex bison
+    glib2-devel libpixman-1-0-devel libslirp-devel gtk3-devel libpulse-devel
+    vulkan-devel shaderc-devel spirv-cross-devel glslang-devel spirv-tools"
 PACMAN_DEPS="base-devel git ninja pkgconf python flex bison glib2 pixman libslirp
     gtk3 libpulse vulkan-icd-loader vulkan-headers shaderc spirv-cross glslang
     spirv-tools"
@@ -176,6 +179,7 @@ sha1_check() {   # sha1_check SUMSFILE, in the current directory
 linux_pm() {
     if command -v apt-get >/dev/null 2>&1; then echo apt
     elif command -v dnf >/dev/null 2>&1; then echo dnf
+    elif command -v zypper >/dev/null 2>&1; then echo zypper
     elif command -v pacman >/dev/null 2>&1; then echo pacman
     fi
 }
@@ -184,6 +188,7 @@ linux_deps() {   # the package list for $1
     case "$1" in
         apt) echo $APT_DEPS ;;
         dnf) echo $DNF_DEPS ;;
+        zypper) echo $ZYPPER_DEPS ;;
         pacman) echo $PACMAN_DEPS ;;
     esac
 }
@@ -193,7 +198,7 @@ linux_missing() {   # packages of $1's list (or of list $2) that aren't installe
     for p in $list; do
         case "$pm" in
             apt) dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" ;;
-            dnf) rpm -q "$p" >/dev/null 2>&1 ;;
+            dnf|zypper) rpm -q "$p" >/dev/null 2>&1 ;;
             pacman) pacman -Qi "$p" >/dev/null 2>&1 || pacman -Qg "$p" >/dev/null 2>&1 ;;
         esac || missing="$missing $p"
     done
@@ -252,6 +257,10 @@ ${B}Run options${N} (for "ppcosx", "ppcosx run" and "ppcosx install")
   --attach-dvd IMG DVD/CD image to insert: .iso .cdr .dmg .toast (also --dvd)
   --verbose        verbose (text) boot instead of the grey Apple
   --snapshot       throw away all disk writes when the VM quits
+  --fps            live frame-rate meter in this terminal: how often the picture
+                   on screen really changes, plus the card's draws per second
+  --no-tablet      relative mouse only (no absolute tablet): if the pointer
+                   clicks but does not move; click the window to capture it
   --no-audio       no sound (Mac OS X runs normally, nothing reaches your speakers)
   --ssh-port N     forward host 127.0.0.1:N to guest port 22
   --monitor        QEMU monitor on 127.0.0.1:4444 (HMP) and :4445 (QMP)
@@ -303,6 +312,7 @@ linux_install() {   # linux_install PM WHAT PACKAGES...: install what's missing
             # shellcheck disable=SC2086
             apt) $sudo apt-get update && $sudo apt-get install -y $missing ;;
             dnf) $sudo dnf install -y $missing ;;
+            zypper) $sudo zypper --non-interactive install $missing ;;
             pacman) $sudo pacman -S --needed --noconfirm $missing ;;
         esac || return 1
     fi
@@ -341,7 +351,7 @@ setup_linux_prebuilt() {
         apt) linux_install apt "run-time libraries" $APT_RUNTIME_DEPS || {
                  warn "could not install the prebuilt QEMU's libraries; building QEMU instead"
                  return 1; } ;;
-        dnf|pacman) linux_install "$pm" "dependencies" $(linux_deps "$pm") || return 1 ;;
+        dnf|zypper|pacman) linux_install "$pm" "dependencies" $(linux_deps "$pm") || return 1 ;;
         *) return 1 ;;
     esac
     sha=$(git -C "$REPO" rev-parse HEAD:qemu 2>/dev/null) || return 1
@@ -395,7 +405,7 @@ setup_linux_prebuilt() {
 setup_linux() {
     local pm
     pm=$(linux_pm)
-    [ -n "$pm" ] || die "no apt-get, dnf or pacman found. Install these (or your
+    [ -n "$pm" ] || die "no apt-get, dnf, zypper or pacman found. Install these (or your
     distribution's names for them), then run $PROG setup again:
     $(echo $APT_DEPS)"
     linux_install "$pm" "build dependencies" $(linux_deps "$pm") \
@@ -762,7 +772,16 @@ build_common() {   # $1 = disk, $2 = "cd" when booting from CD
     local HOST_UI
     local AUDIO
     if [ "$IS_MAC" = 1 ]; then AUDIO=coreaudio; HOST_UI=(-display cocoa)
-    else AUDIO=pa; HOST_UI=(-display gtk,zoom-to-fit=on); fi
+    else
+        HOST_UI=(-display gtk,zoom-to-fit=on)
+        # PulseAudio if this QEMU has it, else PipeWire, else OSS; a build
+        # without any of them stays silent rather than refusing to start.
+        local drivers; drivers=$("$QEMU" -audio help 2>/dev/null)
+        AUDIO=none
+        for d in pa pipewire sdl oss; do
+            if printf '%s\n' "$drivers" | grep -qx "$d"; then AUDIO=$d; break; fi
+        done
+    fi
     # --no-audio: the Mac still has its sound chip, but nothing reaches
     # the host's audio system (for hosts where that misbehaves).
     [ "$NO_AUDIO" = 1 ] && AUDIO=none
@@ -828,6 +847,8 @@ parse_run_opts() {
     CARD="${PPCOSX_CARD:-9700}"
     VERBOSE=0; SNAPSHOT=0; SSH_PORT=; MONITOR=0; TRACE=0; MODE=radeon
     NO_AUDIO="${PPCOSX_NO_AUDIO:-0}"
+    NO_TABLET="${PPCOSX_NO_TABLET:-0}"
+    FPS="${PPCOSX_FPS:-0}"
     GPU="${PPCOSX_GPU:-}"
     [ -n "$GPU" ] || { apple_silicon && GPU=metal || GPU=vulkan; }
     EXTRA=()
@@ -851,12 +872,15 @@ parse_run_opts() {
             --jaguar) CARD=9000 ;;
             --gpumetal) GPU=metal ;;
             --gpuvulkan) GPU=vulkan ;;
+            --gpuvulkan-rs) GPU=vulkan ;;   # old name
             --gpu) [ $# -ge 2 ] || die "--gpu takes metal or vulkan"
                    GPU="$2"; shift ;;
             --gpu=*) GPU="${1#--gpu=}" ;;
             --verbose|-v) VERBOSE=1 ;;
             --snapshot) SNAPSHOT=1 ;;
             --no-audio) NO_AUDIO=1 ;;
+            --no-tablet) NO_TABLET=1 ;;
+            --fps) FPS=1 ;;
             --ssh-port) SSH_PORT="$2"; shift ;;
             --monitor) MONITOR=1 ;;
             --trace-gpu) TRACE=1 ;;
@@ -879,6 +903,7 @@ parse_run_opts() {
     [ "$CPU_MHZ" -ge 100 ] && [ "$CPU_MHZ" -le 4000 ] || die "--cpu-mhz must be 100-4000"
     case "$RES" in [0-9]*x[0-9]*) ;; *) die "--res looks like 1024x768" ;; esac
     case "$CARD" in 9700|9000) ;; *) die "--card takes 9700 (Tiger/Leopard) or 9000 (Jaguar)" ;; esac
+    [ "$GPU" = vulkan-rs ] && GPU=vulkan   # old name
     case "$GPU" in metal|vulkan) ;; *) die "--gpu takes metal or vulkan" ;; esac
     [ "$GPU" = metal ] && [ "$IS_MAC" = 0 ] && die "Metal is macOS only; on $HOST_OS use --gpu vulkan"
     [ "$GPU" = metal ] && ! apple_silicon && die "the Metal renderer needs an Apple Silicon GPU; on an Intel Mac use --gpu vulkan (the default)"
@@ -918,8 +943,12 @@ cmd_run() {
             -device ich9-usb-uhci1,masterbus=usb-controller-0.0,firstport=0,multifunction=on
             -device ich9-usb-uhci2,masterbus=usb-controller-0.0,firstport=2,multifunction=on
             -device ich9-usb-uhci3,masterbus=usb-controller-0.0,firstport=4,multifunction=on
-            -device virtio-tablet-pci
-            -device usb-tablet,bus=usb-bus.0)   # absolute pointer for tools/vmctl.py
+            )
+        # Absolute pointers, for tools/vmctl.py.  --no-tablet leaves only the
+        # relative usb-mouse (click the window to capture it, Ctrl+Alt+G
+        # releases): on some hosts Mac OS X ignores the tablet's movement.
+        [ "$NO_TABLET" = 1 ] || QARGS+=(-device virtio-tablet-pci
+            -device usb-tablet,bus=usb-bus.0)
         say "Booting ${DISK#$REPO/} with the plain VGA framebuffer (no 3D)"
     else
         # The Radeon is pinned to PCI slot $RADEON_SLOT so the node path below
@@ -943,7 +972,14 @@ cmd_run() {
         fi
         boot="$boot device-end then init-program go"
 
-        local dev="ati-radeon-$CARD,addr=$RADEON_SLOT.0,vgamem_mb=$VRAM,renderer=$GPU"
+        local dev="ati-radeon-$CARD,addr=$RADEON_SLOT.0,vgamem_mb=$VRAM"
+        # A QEMU older than the renderer option picks its one built-in
+        # backend (Metal on a Mac, the Rust Vulkan one on Linux) itself.
+        if "$QEMU" -device "ati-radeon-$CARD,help" 2>&1 | grep -q 'renderer='; then
+            dev="$dev,renderer=$GPU"
+        elif [ "$GPU" = vulkan ]; then
+            warn "this QEMU has no renderer option; it uses its built-in Vulkan backend"
+        fi
         if [ "$CARD" = 9000 ] && [ "$GPU" != metal ]; then
             # The Radeon 9000's R200 3D engine only has a Metal renderer;
             # elsewhere the card falls back to the CPU renderer.
@@ -966,7 +1002,7 @@ cmd_run() {
         # Mac OS X 10.2's USB HID driver reads an absolute pointer as
         # relative motion (the cursor sticks in a corner): Jaguar gets the
         # relative usb-mouse only, and the mouse has to be captured.
-        [ "$CARD" = 9000 ] || QARGS+=(-device usb-tablet,bus=usb-bus.0)
+        [ "$CARD" = 9000 ] || [ "$NO_TABLET" = 1 ] || QARGS+=(-device usb-tablet,bus=usb-bus.0)
         if [ "$TRACE" = 1 ]; then QARGS+=(-trace 'ppc_mac_gpu_*')
         else QARGS+=(-trace ppc_mac_gpu_realize); fi
         say "Booting ${DISK#$REPO/} with the ATI Radeon $CARD PRO ($VRAM MB, $GPU${ROM:+, ROM $(basename "$ROM")})"
@@ -980,6 +1016,24 @@ cmd_run() {
     [ "$SNAPSHOT" = 1 ] && hint "--snapshot: nothing you do in this session is saved to the disk."
 
     mkdir -p "$VM_DIR"
+    if [ "$FPS" = 1 ]; then
+        if [ "$MODE" = vga ]; then
+            warn "--fps needs the Radeon (no meter on the plain framebuffer)"
+        else
+            # A live line in this terminal: how often the picture really
+            # changed, and how hard the card worked.  QEMU keeps this shell's
+            # pid (exec), so the meter ends when QEMU does.
+            : > "$VM_DIR/gpu-trace.log"
+            ( tail -n0 --pid=$$ -F "$VM_DIR/gpu-trace.log" 2>/dev/null | while IFS= read -r l; do
+                  case "$l" in
+                      *"ppc-mac-gpu fps:"*) fpsl="${l#*ppc-mac-gpu }" ;;
+                      *"ppc-mac-gpu rate:"*) ratel=$(printf '%s' "${l#*rate: }" | sed 's/[0-9.]* flips\/s, [0-9.]* present-ops\/s, //') ;;
+                      *) continue ;;
+                  esac
+                  printf '\r\033[2K%s | %s' "${fpsl:-fps: -}" "${ratel:-}" >&2
+              done ) &
+        fi
+    fi
     exec "$QEMU" "${QARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}
 }
 
